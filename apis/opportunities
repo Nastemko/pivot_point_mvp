@@ -1,0 +1,67 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field
+import databutton as db
+from app.auth import AuthorizedUser
+from google.oauth2 import service_account
+from google.cloud import firestore
+import json
+
+router = APIRouter()
+
+# --- Explicitly initialize Firestore client with service account ---
+# Get credentials from Databutton secrets
+creds_json_str = db.secrets.get("FIREBASE_ADMIN_SDK_CREDENTIALS")
+creds_info = json.loads(creds_json_str)
+credentials = service_account.Credentials.from_service_account_info(creds_info)
+
+# Initialize client with the explicit credentials
+db_client = firestore.Client(credentials=credentials)
+# --- End of explicit initialization ---
+
+class Opportunity(BaseModel):
+    title: str
+    description: str
+    reach: int
+    impact: int = Field(..., ge=1, le=5)
+    confidence: int = Field(..., ge=0, le=100)
+    effort: int
+    user_id: str
+
+class OpportunityResponse(Opportunity):
+    id: str
+    rice_score: float
+
+@router.post("/opportunities", response_model=OpportunityResponse)
+async def create_opportunity(opportunity: Opportunity, user: AuthorizedUser):
+    """
+    Create a new opportunity and save it to Firestore.
+    Calculates the R.I.C.E. score.
+    """
+    if user.sub != opportunity.user_id:
+        raise HTTPException(status_code=403, detail="User ID does not match authenticated user")
+
+    rice_score = (opportunity.reach * opportunity.impact * (opportunity.confidence / 100)) / opportunity.effort
+
+    # Create a new document in the 'opportunities' collection
+    doc_ref = db_client.collection("opportunities").document()
+    opportunity_data = opportunity.dict()
+    opportunity_data["rice_score"] = rice_score
+
+    doc_ref.set(opportunity_data)
+
+    return OpportunityResponse(id=doc_ref.id, **opportunity_data)
+
+
+@router.get("/opportunities", response_model=list[OpportunityResponse])
+async def list_opportunities(user: AuthorizedUser):
+    """
+    List all opportunities for the authenticated user.
+    """
+    opportunities = []
+    docs = db_client.collection("opportunities").where("user_id", "==", user.sub).stream()
+    for doc in docs:
+        opportunity_data = doc.to_dict()
+        opportunities.append(OpportunityResponse(id=doc.id, **opportunity_data))
+    return opportunities
+
+
